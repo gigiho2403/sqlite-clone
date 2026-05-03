@@ -717,11 +717,13 @@ typedef enum {
 typedef enum {
     STATEMENT_INSERT,
     STATEMENT_SELECT,
+    STATEMENT_DELETE,
 } StatementType;
 
 typedef struct {
     StatementType type;
     Row           row_to_insert;
+    uint32_t      id_to_delete;
 } Statement;
 
 PrepareResult prepare_insert(InputBuffer* ib, Statement* stmt) {
@@ -747,12 +749,25 @@ PrepareResult prepare_insert(InputBuffer* ib, Statement* stmt) {
     return PREPARE_SUCCESS;
 }
 
+PrepareResult prepare_delete(InputBuffer* ib, Statement* stmt) {
+    stmt->type = STATEMENT_DELETE;
+
+    int id;
+    int assigned = sscanf(ib->buffer, "delete %d", &id);
+    if (assigned < 1) return PREPARE_SYNTAX_ERROR;
+    if (id < 0)       return PREPARE_NEGATIVE_ID;
+
+    stmt->id_to_delete = (uint32_t)id;
+    return PREPARE_SUCCESS;
+}
+
 PrepareResult prepare_statement(InputBuffer* ib, Statement* stmt) {
     if (strncmp(ib->buffer, "insert", 6) == 0) return prepare_insert(ib, stmt);
     if (strcmp(ib->buffer,  "select") == 0) {
         stmt->type = STATEMENT_SELECT;
         return PREPARE_SUCCESS;
     }
+    if (strncmp(ib->buffer, "delete", 6) == 0) return prepare_delete(ib, stmt);
     return PREPARE_UNRECOGNIZED_STATEMENT;
 }
 
@@ -761,6 +776,7 @@ PrepareResult prepare_statement(InputBuffer* ib, Statement* stmt) {
 typedef enum {
     EXECUTE_SUCCESS,
     EXECUTE_DUPLICATE_KEY,
+    EXECUTE_KEY_NOT_FOUND,
 } ExecuteResult;
 
 /*
@@ -1104,6 +1120,68 @@ ExecuteResult execute_insert(Statement* stmt, Table* t) {
     return EXECUTE_SUCCESS;
 }
 
+/*
+ * execute_delete — removes the row with stmt->id_to_delete from the leaf.
+ *
+ * Algorithm:
+ *   1. table_find positions the cursor at the cell that holds (or would hold)
+ *      the target key.
+ *   2. Verify the key actually exists; return EXECUTE_KEY_NOT_FOUND otherwise.
+ *   3. Shift all cells after the target one position to the left (overwrite it).
+ *   4. Decrement leaf_node_num_cells.
+ *   5. If we deleted the leaf's max key AND the leaf is not the root AND it still
+ *      has at least one cell AND it is not the right-child of its parent, update
+ *      the separator key in the parent to the new max key.
+ */
+ExecuteResult execute_delete(Statement* stmt, Table* t) {
+    uint32_t key = stmt->id_to_delete;
+    Cursor*  c   = table_find(t, key);
+
+    void*    node      = get_page(t->pager, c->page_num);
+    uint32_t num_cells = *leaf_node_num_cells(node);
+
+    /* Key not present: cursor lands past the last cell or key mismatches */
+    if (c->cell_num >= num_cells || *leaf_node_key(node, c->cell_num) != key) {
+        free(c);
+        return EXECUTE_KEY_NOT_FOUND;
+    }
+
+    /* Was this the last (maximum) key in the leaf? */
+    bool     deleted_was_max = (c->cell_num == num_cells - 1);
+    uint32_t old_max         = *leaf_node_key(node, num_cells - 1);
+
+    /* Shift cells after the deleted position one slot to the left */
+    for (uint32_t i = c->cell_num; i < num_cells - 1; i++) {
+        memcpy(leaf_node_cell(node, i),
+               leaf_node_cell(node, i + 1),
+               LEAF_NODE_CELL_SIZE);
+    }
+    *leaf_node_num_cells(node) -= 1;
+
+    /*
+     * If we removed the max key, the separator stored in the parent for this
+     * leaf is stale — update it to the new max key, but only when:
+     *   • the leaf is not the tree root (root has no parent separator)
+     *   • the leaf still has at least one cell (otherwise there is no new max)
+     *   • the leaf is not the right-child (right-child has no separator in parent)
+     */
+    uint32_t new_num_cells = *leaf_node_num_cells(node);
+    if (deleted_was_max && !is_root(node) && new_num_cells > 0) {
+        uint32_t new_max    = *leaf_node_key(node, new_num_cells - 1);
+        void*    parent     = get_page(t->pager, *node_parent(node));
+        uint32_t child_idx  = internal_node_find_child(parent, old_max);
+        uint32_t parent_keys = *internal_node_num_keys(parent);
+
+        /* child_idx == parent_keys means right-child — no separator to update */
+        if (child_idx < parent_keys) {
+            *internal_node_key(parent, child_idx) = new_max;
+        }
+    }
+
+    free(c);
+    return EXECUTE_SUCCESS;
+}
+
 ExecuteResult execute_select(Statement* stmt __attribute__((unused)), Table* t) {
     Cursor* c = table_start(t);
     Row row;
@@ -1120,6 +1198,7 @@ ExecuteResult execute_statement(Statement* stmt, Table* t) {
     switch (stmt->type) {
         case STATEMENT_INSERT: return execute_insert(stmt, t);
         case STATEMENT_SELECT: return execute_select(stmt, t);
+        case STATEMENT_DELETE: return execute_delete(stmt, t);
     }
     return EXECUTE_SUCCESS;
 }
@@ -1161,8 +1240,9 @@ int main(int argc, char* argv[]) {
         }
 
         switch (execute_statement(&stmt, table)) {
-            case EXECUTE_SUCCESS:       printf("Executed.\n");           break;
-            case EXECUTE_DUPLICATE_KEY: printf("Error: Duplicate key.\n"); break;
+            case EXECUTE_SUCCESS:       printf("Executed.\n");                    break;
+            case EXECUTE_DUPLICATE_KEY: printf("Error: Duplicate key.\n");        break;
+            case EXECUTE_KEY_NOT_FOUND: printf("Error: Key not found.\n");        break;
         }
     }
 }

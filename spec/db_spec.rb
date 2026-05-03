@@ -185,6 +185,72 @@ describe 'database' do
     (29..35).each { |i| expect(result[75 + (i - 28)]).to eq("      - #{i}") }
   end
 
+  it 'deletes a row and it no longer appears in select' do
+    result = run_script([
+      "insert 1 user1 person1@example.com",
+      "insert 2 user2 person2@example.com",
+      "insert 3 user3 person3@example.com",
+      "delete 2",
+      "select",
+      ".exit",
+    ])
+    expect(result).to match_array([
+      "db > Executed.",
+      "db > Executed.",
+      "db > Executed.",
+      "db > Executed.",
+      "db > (1, user1, person1@example.com)",
+      "(3, user3, person3@example.com)",
+      "Executed.",
+      "db > ",
+    ])
+  end
+
+  it 'deleting the max key updates the parent separator' do
+    # Insert 14 rows → 2-leaf tree.  Leaf 1 holds 1-7 (separator key = 7).
+    # Delete row 7 → leaf 1's new max is 6 → separator in parent must become 6.
+    script = (1..14).map { |i| "insert #{i} user#{i} person#{i}@example.com" }
+    script << "delete 7"
+    script << ".btree"
+    script << ".exit"
+    result = run_script(script)
+
+    # After deletion the separator should read 6, not 7
+    expect(result).to include("  - key 6")
+    expect(result).not_to include("  - key 7")
+  end
+
+  it 'returns an error when deleting a non-existent key' do
+    result = run_script([
+      "insert 1 user1 person1@example.com",
+      "delete 99",
+      "select",
+      ".exit",
+    ])
+    expect(result).to match_array([
+      "db > Executed.",
+      "db > Error: Key not found.",
+      "db > (1, user1, person1@example.com)",
+      "Executed.",
+      "db > ",
+    ])
+  end
+
+  it 'persists deletions across connections' do
+    run_script([
+      "insert 1 user1 person1@example.com",
+      "insert 2 user2 person2@example.com",
+      "delete 1",
+      ".exit",
+    ])
+    result = run_script(["select", ".exit"])
+    expect(result).to match_array([
+      "db > (2, user2, person2@example.com)",
+      "Executed.",
+      "db > ",
+    ])
+  end
+
   it 'prints an error message when inserting a duplicate id' do
     result = run_script([
       "insert 1 user1 person1@example.com",
