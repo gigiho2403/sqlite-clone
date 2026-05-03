@@ -718,6 +718,7 @@ typedef enum {
     STATEMENT_INSERT,
     STATEMENT_SELECT,
     STATEMENT_DELETE,
+    STATEMENT_UPDATE,
 } StatementType;
 
 typedef struct {
@@ -761,6 +762,35 @@ PrepareResult prepare_delete(InputBuffer* ib, Statement* stmt) {
     return PREPARE_SUCCESS;
 }
 
+/*
+ * prepare_update — parses "update <id> <username> <email>"
+ * The id acts as the lookup key and is also stored in row_to_insert.id
+ * so that execute_update can find and overwrite the correct row.
+ * Changing a row's id (primary key) is not supported.
+ */
+PrepareResult prepare_update(InputBuffer* ib, Statement* stmt) {
+    stmt->type = STATEMENT_UPDATE;
+
+    int  id;
+    char username[COLUMN_USERNAME_SIZE + 2];
+    char email[COLUMN_EMAIL_SIZE + 2];
+
+    int assigned = sscanf(ib->buffer, "update %d %33s %256s", &id, username, email);
+    if (assigned < 3) return PREPARE_SYNTAX_ERROR;
+
+    if (id < 0)                                   return PREPARE_NEGATIVE_ID;
+    if (strlen(username) > COLUMN_USERNAME_SIZE)  return PREPARE_STRING_TOO_LONG;
+    if (strlen(email)    > COLUMN_EMAIL_SIZE)     return PREPARE_STRING_TOO_LONG;
+
+    stmt->row_to_insert.id = (uint32_t)id;
+    strncpy(stmt->row_to_insert.username, username, COLUMN_USERNAME_SIZE);
+    strncpy(stmt->row_to_insert.email,    email,    COLUMN_EMAIL_SIZE);
+    stmt->row_to_insert.username[COLUMN_USERNAME_SIZE] = '\0';
+    stmt->row_to_insert.email[COLUMN_EMAIL_SIZE]       = '\0';
+
+    return PREPARE_SUCCESS;
+}
+
 PrepareResult prepare_statement(InputBuffer* ib, Statement* stmt) {
     if (strncmp(ib->buffer, "insert", 6) == 0) return prepare_insert(ib, stmt);
     if (strcmp(ib->buffer,  "select") == 0) {
@@ -768,6 +798,7 @@ PrepareResult prepare_statement(InputBuffer* ib, Statement* stmt) {
         return PREPARE_SUCCESS;
     }
     if (strncmp(ib->buffer, "delete", 6) == 0) return prepare_delete(ib, stmt);
+    if (strncmp(ib->buffer, "update", 6) == 0) return prepare_update(ib, stmt);
     return PREPARE_UNRECOGNIZED_STATEMENT;
 }
 
@@ -1194,11 +1225,40 @@ ExecuteResult execute_select(Statement* stmt __attribute__((unused)), Table* t) 
     return EXECUTE_SUCCESS;
 }
 
+/*
+ * execute_update — overwrites username + email for an existing row in place.
+ *
+ * Algorithm:
+ *   1. table_find positions the cursor at the cell for the target id.
+ *   2. Verify the key exists; return EXECUTE_KEY_NOT_FOUND otherwise.
+ *   3. serialize_row writes the updated row directly into the leaf's value slot.
+ *      The id (key) is unchanged, so the B-tree structure needs no adjustment.
+ */
+ExecuteResult execute_update(Statement* stmt, Table* t) {
+    uint32_t key = stmt->row_to_insert.id;
+    Cursor*  c   = table_find(t, key);
+
+    void*    node      = get_page(t->pager, c->page_num);
+    uint32_t num_cells = *leaf_node_num_cells(node);
+
+    if (c->cell_num >= num_cells || *leaf_node_key(node, c->cell_num) != key) {
+        free(c);
+        return EXECUTE_KEY_NOT_FOUND;
+    }
+
+    /* Overwrite the value portion of the cell (key stays the same) */
+    serialize_row(&stmt->row_to_insert, cursor_value(c));
+
+    free(c);
+    return EXECUTE_SUCCESS;
+}
+
 ExecuteResult execute_statement(Statement* stmt, Table* t) {
     switch (stmt->type) {
         case STATEMENT_INSERT: return execute_insert(stmt, t);
         case STATEMENT_SELECT: return execute_select(stmt, t);
         case STATEMENT_DELETE: return execute_delete(stmt, t);
+        case STATEMENT_UPDATE: return execute_update(stmt, t);
     }
     return EXECUTE_SUCCESS;
 }

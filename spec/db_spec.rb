@@ -251,6 +251,55 @@ describe 'database' do
     ])
   end
 
+  it 'updates a row and the new values appear in select' do
+    result = run_script([
+      "insert 1 alice alice@example.com",
+      "insert 2 bob bob@example.com",
+      "update 1 alicia alicia@example.com",
+      "select",
+      ".exit",
+    ])
+    expect(result).to match_array([
+      "db > Executed.",
+      "db > Executed.",
+      "db > Executed.",
+      "db > (1, alicia, alicia@example.com)",
+      "(2, bob, bob@example.com)",
+      "Executed.",
+      "db > ",
+    ])
+  end
+
+  it 'returns an error when updating a non-existent key' do
+    result = run_script([
+      "insert 1 alice alice@example.com",
+      "update 99 ghost ghost@example.com",
+      "select",
+      ".exit",
+    ])
+    expect(result).to match_array([
+      "db > Executed.",
+      "db > Error: Key not found.",
+      "db > (1, alice, alice@example.com)",
+      "Executed.",
+      "db > ",
+    ])
+  end
+
+  it 'persists updates across connections' do
+    run_script([
+      "insert 1 alice alice@example.com",
+      "update 1 alicia alicia@example.com",
+      ".exit",
+    ])
+    result = run_script(["select", ".exit"])
+    expect(result).to match_array([
+      "db > (1, alicia, alicia@example.com)",
+      "Executed.",
+      "db > ",
+    ])
+  end
+
   it 'prints an error message when inserting a duplicate id' do
     result = run_script([
       "insert 1 user1 person1@example.com",
