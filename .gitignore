@@ -1,0 +1,4 @@
+db
+db.dSYM/
+*.db
+.DS_Store
